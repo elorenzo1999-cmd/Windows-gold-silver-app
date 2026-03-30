@@ -1,7 +1,29 @@
 """Microsoft 365 Environment Manager — desktop GUI."""
 
-import json
+import subprocess
 import sys
+
+
+def _bootstrap():
+    """Auto-install any missing dependencies before the app starts."""
+    pkgs = {"PySide6": "PySide6", "msal": "msal", "requests": "requests"}
+    missing = []
+    for import_name, install_name in pkgs.items():
+        try:
+            __import__(import_name.lower())
+        except ImportError:
+            missing.append(install_name)
+    if missing:
+        print(f"Installing missing packages: {', '.join(missing)} ...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        )
+        print("Done. Launching app...")
+
+
+_bootstrap()
+
+import json
 import threading
 
 from PySide6 import QtCore, QtGui, QtWidgets
