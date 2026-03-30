@@ -1,254 +1,820 @@
-import sys
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+"""Microsoft 365 Environment Manager — desktop GUI."""
 
-import pandas as pd
-import pyqtgraph as pg
-import yfinance as yf
+import json
+import sys
+import threading
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
-
-@dataclass
-class AssetQuote:
-    name: str
-    symbol: str
-    price: float | None
-    change: float | None
-    updated: datetime | None
+from auth import AuthError, M365Auth
+from graph_api import GraphAPI, GraphError
 
 
-ASSETS = [
-    ("Gold", "GC=F"),
-    ("Silver", "SI=F"),
-    ("GDXJ", "GDXJ"),
-]
+# ── Dark theme palette ────────────────────────────────────────────────────────
+
+def _apply_theme(app: QtWidgets.QApplication) -> None:
+    app.setStyle("Fusion")
+    pal = QtGui.QPalette()
+    pal.setColor(QtGui.QPalette.Window, QtGui.QColor("#0f172a"))
+    pal.setColor(QtGui.QPalette.WindowText, QtGui.QColor("#e2e8f0"))
+    pal.setColor(QtGui.QPalette.Base, QtGui.QColor("#1e293b"))
+    pal.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor("#0f172a"))
+    pal.setColor(QtGui.QPalette.Text, QtGui.QColor("#e2e8f0"))
+    pal.setColor(QtGui.QPalette.Button, QtGui.QColor("#1e293b"))
+    pal.setColor(QtGui.QPalette.ButtonText, QtGui.QColor("#e2e8f0"))
+    pal.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#38bdf8"))
+    pal.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#0f172a"))
+    pal.setColor(QtGui.QPalette.ToolTipBase, QtGui.QColor("#1e293b"))
+    pal.setColor(QtGui.QPalette.ToolTipText, QtGui.QColor("#e2e8f0"))
+    app.setPalette(pal)
+    app.setStyleSheet(
+        """
+        QWidget { font-size: 13px; }
+        QMainWindow, QDialog { background: #0f172a; }
+        QTabWidget::pane { border: 1px solid #334155; border-radius: 8px; }
+        QTabBar::tab { background: #1e293b; color: #94a3b8; padding: 8px 20px;
+                       border-top-left-radius: 6px; border-top-right-radius: 6px; }
+        QTabBar::tab:selected { background: #0f172a; color: #e2e8f0; }
+        QTableWidget { gridline-color: #1e293b; border: none; }
+        QTableWidget::item:selected { background: #38bdf8; color: #0f172a; }
+        QHeaderView::section { background: #1e293b; color: #94a3b8;
+                               padding: 6px; border: none; }
+        QPushButton { background: #1e293b; color: #e2e8f0; border-radius: 6px;
+                      padding: 6px 16px; border: 1px solid #334155; }
+        QPushButton:hover { background: #334155; }
+        QPushButton#primary { background: #38bdf8; color: #0f172a;
+                               border: none; font-weight: 600; }
+        QPushButton#primary:hover { background: #7dd3fc; }
+        QPushButton#danger { background: #ef4444; color: #fff; border: none; }
+        QPushButton#danger:hover { background: #f87171; }
+        QLineEdit, QComboBox, QTextEdit, QPlainTextEdit {
+            background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+            border-radius: 6px; padding: 6px 10px; }
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+            border-color: #38bdf8; }
+        QLabel#heading { font-size: 18px; font-weight: 600; }
+        QLabel#subheading { color: #94a3b8; }
+        QLabel#status_ok { color: #22c55e; }
+        QLabel#status_err { color: #ef4444; }
+        QFrame#card { background: #1e293b; border-radius: 10px; }
+        QScrollBar:vertical { background: #1e293b; width: 8px; border-radius: 4px; }
+        QScrollBar::handle:vertical { background: #334155; border-radius: 4px; }
+        """
+    )
 
 
-class PriceCard(QtWidgets.QFrame):
-    def __init__(self, title: str, parent: QtWidgets.QWidget | None = None) -> None:
+# ── Login widget ──────────────────────────────────────────────────────────────
+
+class LoginWidget(QtWidgets.QWidget):
+    logged_in = QtCore.Signal(M365Auth, GraphAPI)
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("priceCard")
-        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self.setProperty("class", "card")
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setAlignment(QtCore.Qt.AlignCenter)
+
+        card = QtWidgets.QFrame()
+        card.setObjectName("card")
+        card.setFixedWidth(420)
+        layout = QtWidgets.QVBoxLayout(card)
+        layout.setContentsMargins(32, 32, 32, 32)
+        layout.setSpacing(16)
+
+        title = QtWidgets.QLabel("Microsoft 365 Manager")
+        title.setObjectName("heading")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+
+        sub = QtWidgets.QLabel("Sign in with your M365 admin account")
+        sub.setObjectName("subheading")
+        sub.setAlignment(QtCore.Qt.AlignCenter)
+
+        self.username_input = QtWidgets.QLineEdit()
+        self.username_input.setPlaceholderText("admin@yourtenant.onmicrosoft.com")
+
+        self.password_input = QtWidgets.QLineEdit()
+        self.password_input.setPlaceholderText("Password")
+        self.password_input.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.password_input.returnPressed.connect(self._on_connect)
+
+        self.connect_btn = QtWidgets.QPushButton("Connect")
+        self.connect_btn.setObjectName("primary")
+        self.connect_btn.setFixedHeight(40)
+        self.connect_btn.clicked.connect(self._on_connect)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+
+        note = QtWidgets.QLabel("Note: Accounts with MFA enabled are not supported.")
+        note.setObjectName("subheading")
+        note.setAlignment(QtCore.Qt.AlignCenter)
+        note.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(sub)
+        layout.addSpacing(8)
+        layout.addWidget(QtWidgets.QLabel("Username"))
+        layout.addWidget(self.username_input)
+        layout.addWidget(QtWidgets.QLabel("Password"))
+        layout.addWidget(self.password_input)
+        layout.addSpacing(4)
+        layout.addWidget(self.connect_btn)
+        layout.addWidget(self.status_label)
+        layout.addWidget(note)
+
+        outer.addWidget(card)
+
+        self._auth = M365Auth()
+
+    def _on_connect(self):
+        username = self.username_input.text().strip()
+        password = self.password_input.text()
+        if not username or not password:
+            self._set_error("Please enter your username and password.")
+            return
+
+        self.connect_btn.setEnabled(False)
+        self.connect_btn.setText("Connecting…")
+        self.status_label.setObjectName("")
+        self.status_label.setText("")
+
+        def _worker():
+            try:
+                token = self._auth.login(username, password)
+                api = GraphAPI(token)
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_on_success",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(object, api),
+                )
+            except (AuthError, Exception) as exc:
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_on_failure",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, str(exc)),
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @QtCore.Slot(object)
+    def _on_success(self, api: GraphAPI):
+        self.connect_btn.setEnabled(True)
+        self.connect_btn.setText("Connect")
+        self.logged_in.emit(self._auth, api)
+
+    @QtCore.Slot(str)
+    def _on_failure(self, message: str):
+        self.connect_btn.setEnabled(True)
+        self.connect_btn.setText("Connect")
+        self._set_error(message)
+
+    def _set_error(self, msg: str):
+        self.status_label.setObjectName("status_err")
+        self.status_label.setText(msg)
+        self.status_label.style().polish(self.status_label)
+
+
+# ── User dialog ───────────────────────────────────────────────────────────────
+
+class UserDialog(QtWidgets.QDialog):
+    """Create or edit a user."""
+
+    def __init__(self, api: GraphAPI, user: dict | None = None, parent=None):
+        super().__init__(parent)
+        self._api = api
+        self._user = user
+        self.setWindowTitle("New User" if user is None else "Edit User")
+        self.setMinimumWidth(440)
+
+        layout = QtWidgets.QFormLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+
+        self.display_name = QtWidgets.QLineEdit(user.get("displayName", "") if user else "")
+        self.upn = QtWidgets.QLineEdit(user.get("userPrincipalName", "") if user else "")
+        self.job_title = QtWidgets.QLineEdit(user.get("jobTitle", "") if user else "")
+        self.department = QtWidgets.QLineEdit(user.get("department", "") if user else "")
+
+        self.password = QtWidgets.QLineEdit()
+        self.password.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.password.setPlaceholderText("Leave blank to keep existing" if user else "Required")
+
+        self.enabled = QtWidgets.QCheckBox("Account enabled")
+        self.enabled.setChecked(user.get("accountEnabled", True) if user else True)
+
+        layout.addRow("Display Name *", self.display_name)
+        layout.addRow("User Principal Name *", self.upn)
+        layout.addRow("Job Title", self.job_title)
+        layout.addRow("Department", self.department)
+        layout.addRow("Password" + ("" if user else " *"), self.password)
+        layout.addRow("", self.enabled)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addRow(self.status_label)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel
+        )
+        btns.accepted.connect(self._save)
+        btns.rejected.connect(self.reject)
+        layout.addRow(btns)
+
+    def _save(self):
+        display_name = self.display_name.text().strip()
+        upn = self.upn.text().strip()
+        password = self.password.text()
+
+        if not display_name or not upn:
+            self.status_label.setObjectName("status_err")
+            self.status_label.setText("Display Name and UPN are required.")
+            self.status_label.style().polish(self.status_label)
+            return
+
+        if self._user is None and not password:
+            self.status_label.setObjectName("status_err")
+            self.status_label.setText("Password is required for new users.")
+            self.status_label.style().polish(self.status_label)
+            return
+
+        try:
+            if self._user is None:
+                payload = {
+                    "displayName": display_name,
+                    "userPrincipalName": upn,
+                    "accountEnabled": self.enabled.isChecked(),
+                    "passwordProfile": {
+                        "forceChangePasswordNextSignIn": False,
+                        "password": password,
+                    },
+                }
+                if self.job_title.text().strip():
+                    payload["jobTitle"] = self.job_title.text().strip()
+                if self.department.text().strip():
+                    payload["department"] = self.department.text().strip()
+                self._api.create_user(payload)
+            else:
+                payload = {
+                    "displayName": display_name,
+                    "userPrincipalName": upn,
+                    "accountEnabled": self.enabled.isChecked(),
+                    "jobTitle": self.job_title.text().strip(),
+                    "department": self.department.text().strip(),
+                }
+                if password:
+                    payload["passwordProfile"] = {
+                        "forceChangePasswordNextSignIn": False,
+                        "password": password,
+                    }
+                self._api.update_user(self._user["id"], payload)
+            self.accept()
+        except (GraphError, Exception) as exc:
+            self.status_label.setObjectName("status_err")
+            self.status_label.setText(str(exc))
+            self.status_label.style().polish(self.status_label)
+
+
+# ── License dialog ────────────────────────────────────────────────────────────
+
+class ManageLicensesDialog(QtWidgets.QDialog):
+    def __init__(self, api: GraphAPI, user: dict, skus: list[dict], parent=None):
+        super().__init__(parent)
+        self._api = api
+        self._user = user
+        self._skus = skus
+        self.setWindowTitle(f"Licenses — {user.get('displayName', user['id'])}")
+        self.setMinimumSize(520, 400)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        layout.addWidget(QtWidgets.QLabel("Available license SKUs:"))
+
+        self.sku_table = QtWidgets.QTableWidget(0, 4)
+        self.sku_table.setHorizontalHeaderLabels(["SKU Name", "Total", "Used", "Assigned"])
+        self.sku_table.horizontalHeader().setStretchLastSection(False)
+        self.sku_table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.Stretch
+        )
+        self.sku_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.sku_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.sku_table)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        assign_btn = QtWidgets.QPushButton("Assign Selected")
+        assign_btn.setObjectName("primary")
+        assign_btn.clicked.connect(self._assign)
+        remove_btn = QtWidgets.QPushButton("Remove Selected")
+        remove_btn.setObjectName("danger")
+        remove_btn.clicked.connect(self._remove)
+        btn_row.addWidget(assign_btn)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.status_label = QtWidgets.QLabel("")
+        layout.addWidget(self.status_label)
+
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+
+        self._load()
+
+    def _load(self):
+        assigned_ids = {
+            lic["skuId"]
+            for lic in self._api.get_user_licenses(self._user["id"])
+        }
+        self.sku_table.setRowCount(0)
+        self._sku_ids = []
+        for sku in self._skus:
+            row = self.sku_table.rowCount()
+            self.sku_table.insertRow(row)
+            name = sku.get("skuPartNumber", sku["skuId"])
+            total = sku.get("prepaidUnits", {}).get("enabled", 0)
+            used = sku.get("consumedUnits", 0)
+            is_assigned = sku["skuId"] in assigned_ids
+            self.sku_table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
+            self.sku_table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(total)))
+            self.sku_table.setItem(row, 2, QtWidgets.QTableWidgetItem(str(used)))
+            assigned_item = QtWidgets.QTableWidgetItem("Yes" if is_assigned else "No")
+            if is_assigned:
+                assigned_item.setForeground(QtGui.QColor("#22c55e"))
+            self.sku_table.setItem(row, 3, assigned_item)
+            self._sku_ids.append(sku["skuId"])
+
+    def _selected_sku_id(self):
+        rows = self.sku_table.selectedItems()
+        if not rows:
+            return None
+        return self._sku_ids[self.sku_table.currentRow()]
+
+    def _assign(self):
+        sku_id = self._selected_sku_id()
+        if not sku_id:
+            return
+        try:
+            self._api.assign_license(self._user["id"], sku_id)
+            self._load()
+            self.status_label.setObjectName("status_ok")
+            self.status_label.setText("License assigned.")
+            self.status_label.style().polish(self.status_label)
+        except (GraphError, Exception) as exc:
+            self.status_label.setObjectName("status_err")
+            self.status_label.setText(str(exc))
+            self.status_label.style().polish(self.status_label)
+
+    def _remove(self):
+        sku_id = self._selected_sku_id()
+        if not sku_id:
+            return
+        try:
+            self._api.remove_license(self._user["id"], sku_id)
+            self._load()
+            self.status_label.setObjectName("status_ok")
+            self.status_label.setText("License removed.")
+            self.status_label.style().polish(self.status_label)
+        except (GraphError, Exception) as exc:
+            self.status_label.setObjectName("status_err")
+            self.status_label.setText(str(exc))
+            self.status_label.style().polish(self.status_label)
+
+
+# ── Users tab ─────────────────────────────────────────────────────────────────
+
+class UsersTab(QtWidgets.QWidget):
+    def __init__(self, api: GraphAPI, parent=None):
+        super().__init__(parent)
+        self._api = api
+        self._users: list[dict] = []
+        self._skus: list[dict] = []
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(6)
+        layout.setSpacing(12)
 
-        self.title_label = QtWidgets.QLabel(title)
-        self.title_label.setObjectName("cardTitle")
-        self.price_label = QtWidgets.QLabel("--")
-        self.price_label.setObjectName("cardPrice")
-        self.change_label = QtWidgets.QLabel("--")
-        self.change_label.setObjectName("cardChange")
+        # Toolbar
+        toolbar = QtWidgets.QHBoxLayout()
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText("Search users…")
+        self.search_input.textChanged.connect(self._filter)
 
-        layout.addWidget(self.title_label)
-        layout.addStretch()
-        layout.addWidget(self.price_label)
-        layout.addWidget(self.change_label)
+        refresh_btn = QtWidgets.QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._load)
 
-    def update_quote(self, quote: AssetQuote) -> None:
-        if quote.price is None:
-            self.price_label.setText("--")
-            self.change_label.setText("No data")
-            self.change_label.setProperty("state", "neutral")
-            self.change_label.style().polish(self.change_label)
-            return
+        new_btn = QtWidgets.QPushButton("New User")
+        new_btn.setObjectName("primary")
+        new_btn.clicked.connect(self._new_user)
 
-        self.price_label.setText(f"${quote.price:,.2f}")
-        if quote.change is None:
-            self.change_label.setText("--")
-            self.change_label.setProperty("state", "neutral")
-        else:
-            sign = "+" if quote.change >= 0 else ""
-            self.change_label.setText(f"{sign}{quote.change:,.2f}%")
-            self.change_label.setProperty("state", "up" if quote.change >= 0 else "down")
-        self.change_label.style().polish(self.change_label)
+        self.edit_btn = QtWidgets.QPushButton("Edit")
+        self.edit_btn.clicked.connect(self._edit_user)
 
+        self.delete_btn = QtWidgets.QPushButton("Delete")
+        self.delete_btn.setObjectName("danger")
+        self.delete_btn.clicked.connect(self._delete_user)
 
-class GoldSilverApp(QtWidgets.QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("Gold, Silver & GDXJ Dashboard")
-        self.resize(1100, 700)
+        self.license_btn = QtWidgets.QPushButton("Manage Licenses")
+        self.license_btn.clicked.connect(self._manage_licenses)
 
-        self.cards: dict[str, PriceCard] = {}
-        self.current_symbol = ASSETS[0][1]
+        toolbar.addWidget(self.search_input)
+        toolbar.addWidget(refresh_btn)
+        toolbar.addStretch()
+        toolbar.addWidget(new_btn)
+        toolbar.addWidget(self.edit_btn)
+        toolbar.addWidget(self.delete_btn)
+        toolbar.addWidget(self.license_btn)
+        layout.addLayout(toolbar)
 
-        central = QtWidgets.QWidget()
-        root_layout = QtWidgets.QVBoxLayout(central)
-        root_layout.setContentsMargins(24, 24, 24, 24)
-        root_layout.setSpacing(20)
-
-        header_layout = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("Metals & Miners Snapshot")
-        title.setObjectName("appTitle")
-        subtitle = QtWidgets.QLabel("Live snapshot and interactive chart")
-        subtitle.setObjectName("appSubtitle")
-        header_text = QtWidgets.QVBoxLayout()
-        header_text.addWidget(title)
-        header_text.addWidget(subtitle)
-        header_layout.addLayout(header_text)
-        header_layout.addStretch()
-
-        self.last_updated_label = QtWidgets.QLabel("Last updated: --")
-        self.last_updated_label.setObjectName("lastUpdated")
-        header_layout.addWidget(self.last_updated_label)
-        root_layout.addLayout(header_layout)
-
-        cards_layout = QtWidgets.QHBoxLayout()
-        cards_layout.setSpacing(16)
-        for name, symbol in ASSETS:
-            card = PriceCard(name)
-            self.cards[symbol] = card
-            card.mousePressEvent = self._make_card_handler(symbol)
-            cards_layout.addWidget(card)
-        root_layout.addLayout(cards_layout)
-
-        chart_container = QtWidgets.QFrame()
-        chart_container.setObjectName("chartContainer")
-        chart_layout = QtWidgets.QVBoxLayout(chart_container)
-        chart_layout.setContentsMargins(12, 12, 12, 12)
-        chart_layout.setSpacing(8)
-
-        chart_header = QtWidgets.QHBoxLayout()
-        self.chart_title = QtWidgets.QLabel("Gold - 6 Month Trend")
-        self.chart_title.setObjectName("chartTitle")
-        chart_header.addWidget(self.chart_title)
-        chart_header.addStretch()
-
-        self.range_combo = QtWidgets.QComboBox()
-        self.range_combo.addItems(["1M", "3M", "6M", "1Y", "2Y"])
-        self.range_combo.setCurrentText("6M")
-        self.range_combo.currentTextChanged.connect(self.refresh_chart)
-        chart_header.addWidget(self.range_combo)
-
-        chart_layout.addLayout(chart_header)
-
-        self.chart = pg.PlotWidget()
-        self.chart.setBackground(None)
-        self.chart.showGrid(x=True, y=True, alpha=0.2)
-        self.chart.addLegend()
-        self.chart_layout_item = self.chart.getPlotItem()
-        self.chart_layout_item.setLabel("left", "Price", units="USD")
-        self.chart_layout_item.setLabel("bottom", "Date")
-        self.chart_layout_item.setMenuEnabled(False)
-        self.chart_layout_item.hideButtons()
-        chart_layout.addWidget(self.chart)
-
-        root_layout.addWidget(chart_container)
-
-        self.setCentralWidget(central)
-
-        self._apply_theme()
-
-        self.refresh_data()
-        self.refresh_chart()
-
-        self.timer = QtCore.QTimer(self)
-        self.timer.setInterval(60_000)
-        self.timer.timeout.connect(self.refresh_data)
-        self.timer.start()
-
-    def _apply_theme(self) -> None:
-        QtWidgets.QApplication.setStyle("Fusion")
-        palette = QtGui.QPalette()
-        palette.setColor(QtGui.QPalette.Window, QtGui.QColor("#0f172a"))
-        palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor("#e2e8f0"))
-        palette.setColor(QtGui.QPalette.Base, QtGui.QColor("#0f172a"))
-        palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor("#1e293b"))
-        palette.setColor(QtGui.QPalette.Text, QtGui.QColor("#e2e8f0"))
-        palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#1e293b"))
-        palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor("#e2e8f0"))
-        palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#38bdf8"))
-        palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#0f172a"))
-        self.setPalette(palette)
-
-        self.setStyleSheet(
-            """
-            QLabel#appTitle { font-size: 26px; font-weight: 600; }
-            QLabel#appSubtitle { color: #94a3b8; }
-            QLabel#lastUpdated { color: #94a3b8; }
-            QFrame#priceCard { background: #1e293b; border-radius: 16px; }
-            QLabel#cardTitle { color: #94a3b8; font-size: 14px; }
-            QLabel#cardPrice { font-size: 26px; font-weight: 600; }
-            QLabel#cardChange[state="up"] { color: #22c55e; font-weight: 600; }
-            QLabel#cardChange[state="down"] { color: #ef4444; font-weight: 600; }
-            QLabel#cardChange[state="neutral"] { color: #94a3b8; }
-            QFrame#chartContainer { background: #0b1220; border-radius: 20px; }
-            QLabel#chartTitle { font-size: 18px; font-weight: 600; }
-            QComboBox { padding: 6px 10px; border-radius: 10px; background: #1e293b; }
-            """
+        # Table
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["Display Name", "Email / UPN", "Job Title", "Department", "Enabled"]
         )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.Stretch
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        layout.addWidget(self.table)
 
-    def _make_card_handler(self, symbol: str):
-        def handler(event):
-            self.current_symbol = symbol
-            self.refresh_chart()
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setObjectName("subheading")
+        layout.addWidget(self.status_label)
 
-        return handler
+        self._load()
 
-    def refresh_data(self) -> None:
-        quotes = self._fetch_quotes()
-        for quote in quotes:
-            card = self.cards.get(quote.symbol)
-            if card:
-                card.update_quote(quote)
+    def _load(self):
+        self.status_label.setText("Loading users…")
+        QtWidgets.QApplication.processEvents()
 
-        last = max((q.updated for q in quotes if q.updated), default=None)
-        if last:
-            self.last_updated_label.setText(f"Last updated: {last.strftime('%Y-%m-%d %H:%M:%S')}")
-        else:
-            self.last_updated_label.setText("Last updated: --")
+        def _worker():
+            try:
+                users = self._api.get_users()
+                skus = self._api.get_subscribed_skus()
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_populate",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(object, users),
+                    QtCore.Q_ARG(object, skus),
+                )
+            except (GraphError, Exception) as exc:
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_set_error",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, str(exc)),
+                )
 
-    def refresh_chart(self) -> None:
-        self.chart.clear()
-        symbol = self.current_symbol
-        name = next(name for name, sym in ASSETS if sym == symbol)
-        range_text = self.range_combo.currentText()
-        self.chart_title.setText(f"{name} - {range_text} Trend")
+        threading.Thread(target=_worker, daemon=True).start()
 
-        history = self._fetch_history(symbol, range_text)
-        if history.empty:
-            self.chart.plot([], [])
+    @QtCore.Slot(object, object)
+    def _populate(self, users: list[dict], skus: list[dict]):
+        self._users = users
+        self._skus = skus
+        self._render(users)
+        self.status_label.setText(f"{len(users)} user(s) loaded.")
+
+    @QtCore.Slot(str)
+    def _set_error(self, msg: str):
+        self.status_label.setObjectName("status_err")
+        self.status_label.setText(msg)
+        self.status_label.style().polish(self.status_label)
+
+    def _render(self, users: list[dict]):
+        self.table.setRowCount(0)
+        for user in users:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            enabled = user.get("accountEnabled", False)
+            items = [
+                user.get("displayName", ""),
+                user.get("userPrincipalName", ""),
+                user.get("jobTitle") or "",
+                user.get("department") or "",
+                "Yes" if enabled else "No",
+            ]
+            for col, text in enumerate(items):
+                item = QtWidgets.QTableWidgetItem(text)
+                if col == 4:
+                    item.setForeground(
+                        QtGui.QColor("#22c55e") if enabled else QtGui.QColor("#ef4444")
+                    )
+                self.table.setItem(row, col, item)
+            # Store user id in first item
+            self.table.item(row, 0).setData(QtCore.Qt.UserRole, user["id"])
+
+    def _filter(self, text: str):
+        text = text.lower()
+        filtered = [
+            u for u in self._users
+            if text in (u.get("displayName") or "").lower()
+            or text in (u.get("userPrincipalName") or "").lower()
+        ]
+        self._render(filtered)
+
+    def _selected_user(self) -> dict | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        user_id = self.table.item(row, 0).data(QtCore.Qt.UserRole)
+        return next((u for u in self._users if u["id"] == user_id), None)
+
+    def _new_user(self):
+        dlg = UserDialog(self._api, parent=self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self._load()
+
+    def _edit_user(self):
+        user = self._selected_user()
+        if not user:
+            QtWidgets.QMessageBox.information(self, "No selection", "Select a user first.")
+            return
+        dlg = UserDialog(self._api, user=user, parent=self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self._load()
+
+    def _delete_user(self):
+        user = self._selected_user()
+        if not user:
+            QtWidgets.QMessageBox.information(self, "No selection", "Select a user first.")
+            return
+        name = user.get("displayName", user["id"])
+        reply = QtWidgets.QMessageBox.warning(
+            self, "Delete User",
+            f"Permanently delete '{name}'? This cannot be undone.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            self._api.delete_user(user["id"])
+            self._load()
+        except (GraphError, Exception) as exc:
+            QtWidgets.QMessageBox.critical(self, "Error", str(exc))
+
+    def _manage_licenses(self):
+        user = self._selected_user()
+        if not user:
+            QtWidgets.QMessageBox.information(self, "No selection", "Select a user first.")
+            return
+        dlg = ManageLicensesDialog(self._api, user, self._skus, parent=self)
+        dlg.exec()
+
+
+# ── Licenses tab ──────────────────────────────────────────────────────────────
+
+class LicensesTab(QtWidgets.QWidget):
+    def __init__(self, api: GraphAPI, parent=None):
+        super().__init__(parent)
+        self._api = api
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        refresh_btn = QtWidgets.QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._load)
+        toolbar.addStretch()
+        toolbar.addWidget(refresh_btn)
+        layout.addLayout(toolbar)
+
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["License Name (SKU)", "Total Units", "Consumed", "Remaining"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.Stretch
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        layout.addWidget(self.table)
+
+        self.status_label = QtWidgets.QLabel("")
+        self.status_label.setObjectName("subheading")
+        layout.addWidget(self.status_label)
+
+        self._load()
+
+    def _load(self):
+        self.status_label.setText("Loading licenses…")
+
+        def _worker():
+            try:
+                skus = self._api.get_subscribed_skus()
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_populate",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(object, skus),
+                )
+            except (GraphError, Exception) as exc:
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_set_error",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, str(exc)),
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @QtCore.Slot(object)
+    def _populate(self, skus: list[dict]):
+        self.table.setRowCount(0)
+        for sku in skus:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            name = sku.get("skuPartNumber", sku["skuId"])
+            total = sku.get("prepaidUnits", {}).get("enabled", 0)
+            consumed = sku.get("consumedUnits", 0)
+            remaining = max(0, total - consumed)
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(total)))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(str(consumed)))
+            rem_item = QtWidgets.QTableWidgetItem(str(remaining))
+            rem_item.setForeground(
+                QtGui.QColor("#22c55e") if remaining > 0 else QtGui.QColor("#ef4444")
+            )
+            self.table.setItem(row, 3, rem_item)
+        self.status_label.setText(f"{len(skus)} SKU(s) loaded.")
+
+    @QtCore.Slot(str)
+    def _set_error(self, msg: str):
+        self.status_label.setObjectName("status_err")
+        self.status_label.setText(msg)
+        self.status_label.style().polish(self.status_label)
+
+
+# ── Graph Explorer tab ────────────────────────────────────────────────────────
+
+class GraphExplorerTab(QtWidgets.QWidget):
+    def __init__(self, api: GraphAPI, parent=None):
+        super().__init__(parent)
+        self._api = api
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Request bar
+        request_row = QtWidgets.QHBoxLayout()
+        self.method_combo = QtWidgets.QComboBox()
+        self.method_combo.addItems(["GET", "POST", "PATCH", "DELETE"])
+        self.method_combo.setFixedWidth(90)
+        self.method_combo.currentTextChanged.connect(self._toggle_body)
+
+        self.endpoint_input = QtWidgets.QLineEdit()
+        self.endpoint_input.setPlaceholderText("/users  or  /me  or  /groups/…")
+        self.endpoint_input.returnPressed.connect(self._run)
+
+        run_btn = QtWidgets.QPushButton("Run")
+        run_btn.setObjectName("primary")
+        run_btn.setFixedWidth(70)
+        run_btn.clicked.connect(self._run)
+
+        request_row.addWidget(self.method_combo)
+        request_row.addWidget(self.endpoint_input)
+        request_row.addWidget(run_btn)
+        layout.addLayout(request_row)
+
+        # Body
+        self.body_label = QtWidgets.QLabel("Request Body (JSON):")
+        self.body_input = QtWidgets.QPlainTextEdit()
+        self.body_input.setPlaceholderText('{ "key": "value" }')
+        self.body_input.setFixedHeight(100)
+        layout.addWidget(self.body_label)
+        layout.addWidget(self.body_input)
+
+        # Response
+        layout.addWidget(QtWidgets.QLabel("Response:"))
+        self.response_area = QtWidgets.QPlainTextEdit()
+        self.response_area.setReadOnly(True)
+        self.response_area.setFont(QtGui.QFont("Courier New", 11))
+        layout.addWidget(self.response_area)
+
+        self._toggle_body("GET")
+
+    def _toggle_body(self, method: str):
+        visible = method in ("POST", "PATCH")
+        self.body_label.setVisible(visible)
+        self.body_input.setVisible(visible)
+
+    def _run(self):
+        method = self.method_combo.currentText()
+        endpoint = self.endpoint_input.text().strip()
+        if not endpoint:
             return
 
-        dates = history.index.to_pydatetime()
-        prices = history["Close"].values
-        pen = pg.mkPen(color="#38bdf8", width=2)
-        self.chart.plot(dates, prices, pen=pen, name=f"{name} Close")
-        self.chart_layout_item.setLimits(xMin=min(dates).timestamp(), xMax=max(dates).timestamp())
+        body = None
+        if method in ("POST", "PATCH"):
+            raw = self.body_input.toPlainText().strip()
+            if raw:
+                try:
+                    body = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    self.response_area.setPlainText(f"Invalid JSON body:\n{exc}")
+                    return
 
-    def _fetch_quotes(self) -> list[AssetQuote]:
-        results = []
-        for name, symbol in ASSETS:
-            ticker = yf.Ticker(symbol)
-            info = ticker.fast_info
-            price = info.get("lastPrice") if info else None
-            previous = info.get("previousClose") if info else None
-            change = None
-            if price is not None and previous:
-                change = ((price - previous) / previous) * 100
-            results.append(AssetQuote(name=name, symbol=symbol, price=price, change=change, updated=datetime.now()))
-        return results
+        self.response_area.setPlainText("Running…")
 
-    def _fetch_history(self, symbol: str, range_text: str) -> pd.DataFrame:
-        ranges = {
-            "1M": timedelta(days=30),
-            "3M": timedelta(days=90),
-            "6M": timedelta(days=180),
-            "1Y": timedelta(days=365),
-            "2Y": timedelta(days=730),
-        }
-        end = datetime.now()
-        start = end - ranges.get(range_text, timedelta(days=180))
-        data = yf.download(symbol, start=start, end=end, progress=False)
-        return data
+        def _worker():
+            try:
+                result = self._api.execute(method, endpoint, body)
+                text = json.dumps(result, indent=2) if result is not None else "(no content)"
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_show_response",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, text),
+                )
+            except (GraphError, Exception) as exc:
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_show_response",
+                    QtCore.Qt.QueuedConnection,
+                    QtCore.Q_ARG(str, f"Error:\n{exc}"),
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @QtCore.Slot(str)
+    def _show_response(self, text: str):
+        self.response_area.setPlainText(text)
 
 
-def main() -> None:
+# ── Main application window ───────────────────────────────────────────────────
+
+class M365ManagerApp(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Microsoft 365 Environment Manager")
+        self.resize(1200, 750)
+
+        self._stack = QtWidgets.QStackedWidget()
+        self.setCentralWidget(self._stack)
+
+        self._login_widget = LoginWidget()
+        self._login_widget.logged_in.connect(self._on_logged_in)
+        self._stack.addWidget(self._login_widget)
+
+    @QtCore.Slot(object, object)
+    def _on_logged_in(self, auth: M365Auth, api: GraphAPI):
+        dashboard = QtWidgets.QWidget()
+        d_layout = QtWidgets.QVBoxLayout(dashboard)
+        d_layout.setContentsMargins(0, 0, 0, 0)
+        d_layout.setSpacing(0)
+
+        # Header bar
+        header = QtWidgets.QFrame()
+        header.setFixedHeight(48)
+        header.setStyleSheet("background: #1e293b;")
+        h_layout = QtWidgets.QHBoxLayout(header)
+        h_layout.setContentsMargins(20, 0, 20, 0)
+
+        title_lbl = QtWidgets.QLabel("Microsoft 365 Manager")
+        title_lbl.setStyleSheet("font-size:15px; font-weight:600;")
+        user_lbl = QtWidgets.QLabel(f"Signed in as: {auth.username}")
+        user_lbl.setStyleSheet("color: #94a3b8;")
+
+        sign_out_btn = QtWidgets.QPushButton("Sign Out")
+        sign_out_btn.clicked.connect(self._sign_out)
+
+        h_layout.addWidget(title_lbl)
+        h_layout.addStretch()
+        h_layout.addWidget(user_lbl)
+        h_layout.addWidget(sign_out_btn)
+        d_layout.addWidget(header)
+
+        # Tabs
+        tabs = QtWidgets.QTabWidget()
+        tabs.addTab(UsersTab(api), "Users")
+        tabs.addTab(LicensesTab(api), "Licenses")
+        tabs.addTab(GraphExplorerTab(api), "Graph Explorer")
+        d_layout.addWidget(tabs)
+
+        self._stack.addWidget(dashboard)
+        self._stack.setCurrentWidget(dashboard)
+
+    def _sign_out(self):
+        # Remove dashboard widget, go back to login
+        if self._stack.count() > 1:
+            widget = self._stack.widget(1)
+            self._stack.removeWidget(widget)
+            widget.deleteLater()
+        self._login_widget.username_input.clear()
+        self._login_widget.password_input.clear()
+        self._login_widget.status_label.setText("")
+        self._stack.setCurrentWidget(self._login_widget)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
     app = QtWidgets.QApplication(sys.argv)
-    window = GoldSilverApp()
+    _apply_theme(app)
+    window = M365ManagerApp()
     window.show()
     sys.exit(app.exec())
 
