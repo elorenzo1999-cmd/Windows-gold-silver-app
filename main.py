@@ -88,24 +88,26 @@ class LoginWidget(QtWidgets.QWidget):
         sub.setObjectName("subheading")
         sub.setAlignment(QtCore.Qt.AlignCenter)
 
+        hint_label = QtWidgets.QLabel("Username (optional — pre-fills the browser login)")
+        hint_label.setObjectName("subheading")
+
         self.username_input = QtWidgets.QLineEdit()
         self.username_input.setPlaceholderText("admin@yourtenant.onmicrosoft.com")
+        self.username_input.returnPressed.connect(self._on_connect)
 
-        self.password_input = QtWidgets.QLineEdit()
-        self.password_input.setPlaceholderText("Password")
-        self.password_input.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.password_input.returnPressed.connect(self._on_connect)
-
-        self.connect_btn = QtWidgets.QPushButton("Connect")
+        self.connect_btn = QtWidgets.QPushButton("Sign In  →  Opens browser with MFA")
         self.connect_btn.setObjectName("primary")
-        self.connect_btn.setFixedHeight(40)
+        self.connect_btn.setFixedHeight(44)
         self.connect_btn.clicked.connect(self._on_connect)
 
         self.status_label = QtWidgets.QLabel("")
         self.status_label.setAlignment(QtCore.Qt.AlignCenter)
         self.status_label.setWordWrap(True)
 
-        note = QtWidgets.QLabel("Note: Accounts with MFA enabled are not supported.")
+        note = QtWidgets.QLabel(
+            "A Microsoft login page will open in your browser.\n"
+            "Complete sign-in and MFA there — the app will connect automatically."
+        )
         note.setObjectName("subheading")
         note.setAlignment(QtCore.Qt.AlignCenter)
         note.setWordWrap(True)
@@ -113,13 +115,12 @@ class LoginWidget(QtWidgets.QWidget):
         layout.addWidget(title)
         layout.addWidget(sub)
         layout.addSpacing(8)
-        layout.addWidget(QtWidgets.QLabel("Username"))
+        layout.addWidget(hint_label)
         layout.addWidget(self.username_input)
-        layout.addWidget(QtWidgets.QLabel("Password"))
-        layout.addWidget(self.password_input)
         layout.addSpacing(4)
         layout.addWidget(self.connect_btn)
         layout.addWidget(self.status_label)
+        layout.addSpacing(4)
         layout.addWidget(note)
 
         outer.addWidget(card)
@@ -127,20 +128,16 @@ class LoginWidget(QtWidgets.QWidget):
         self._auth = M365Auth()
 
     def _on_connect(self):
-        username = self.username_input.text().strip()
-        password = self.password_input.text()
-        if not username or not password:
-            self._set_error("Please enter your username and password.")
-            return
+        login_hint = self.username_input.text().strip()
 
         self.connect_btn.setEnabled(False)
-        self.connect_btn.setText("Connecting…")
+        self.connect_btn.setText("Waiting for browser sign-in…")
         self.status_label.setObjectName("")
         self.status_label.setText("")
 
         def _worker():
             try:
-                token = self._auth.login(username, password)
+                token = self._auth.login_interactive(login_hint=login_hint)
                 api = GraphAPI(token)
                 QtCore.QMetaObject.invokeMethod(
                     self, "_on_success",
@@ -159,13 +156,13 @@ class LoginWidget(QtWidgets.QWidget):
     @QtCore.Slot(object)
     def _on_success(self, api: GraphAPI):
         self.connect_btn.setEnabled(True)
-        self.connect_btn.setText("Connect")
+        self.connect_btn.setText("Sign In  →  Opens browser with MFA")
         self.logged_in.emit(self._auth, api)
 
     @QtCore.Slot(str)
     def _on_failure(self, message: str):
         self.connect_btn.setEnabled(True)
-        self.connect_btn.setText("Connect")
+        self.connect_btn.setText("Sign In  →  Opens browser with MFA")
         self._set_error(message)
 
     def _set_error(self, msg: str):
@@ -804,7 +801,6 @@ class M365ManagerApp(QtWidgets.QMainWindow):
             self._stack.removeWidget(widget)
             widget.deleteLater()
         self._login_widget.username_input.clear()
-        self._login_widget.password_input.clear()
         self._login_widget.status_label.setText("")
         self._stack.setCurrentWidget(self._login_widget)
 
