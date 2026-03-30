@@ -1,4 +1,4 @@
-"""Microsoft 365 authentication using MSAL ROPC flow."""
+"""Microsoft 365 authentication using MSAL interactive browser flow (supports MFA)."""
 
 import msal
 
@@ -22,29 +22,30 @@ class M365Auth:
         self._token: str | None = None
         self._username: str | None = None
 
-    def login(self, username: str, password: str) -> str:
-        """Authenticate with username/password. Returns access token.
+    def login_interactive(self, login_hint: str = "") -> str:
+        """Open a browser window for interactive login (supports MFA).
 
-        Raises AuthError on failure.
-        Note: Accounts with MFA enabled cannot use this flow.
+        login_hint pre-fills the username in the browser (optional).
+        Returns the access token on success; raises AuthError on failure.
         """
-        result = self._app.acquire_token_by_username_password(
-            username=username,
-            password=password,
+        kwargs = {}
+        if login_hint:
+            kwargs["login_hint"] = login_hint
+
+        result = self._app.acquire_token_interactive(
             scopes=_SCOPES,
+            **kwargs,
         )
+
         if "access_token" in result:
             self._token = result["access_token"]
-            self._username = username
+            # Use the UPN from the token claims if available, else fall back to hint
+            claims = result.get("id_token_claims") or {}
+            self._username = claims.get("preferred_username") or login_hint or "unknown"
             return self._token
 
         error = result.get("error", "unknown_error")
         description = result.get("error_description", "Authentication failed.")
-        if "AADSTS50076" in description or "MFA" in description.upper():
-            raise AuthError(
-                "This account requires Multi-Factor Authentication (MFA). "
-                "Username/password login is not supported for MFA-enabled accounts."
-            )
         raise AuthError(f"{error}: {description}")
 
     def logout(self):
