@@ -6,7 +6,11 @@ import sys
 
 def _bootstrap():
     """Auto-install any missing dependencies before the app starts."""
-    pkgs = {"PySide6": "PySide6", "msal": "msal", "requests": "requests"}
+    pkgs = {
+        "PySide6": "PySide6",
+        "msal": "msal",
+        "requests": "requests",
+    }
     missing = []
     for import_name, install_name in pkgs.items():
         try:
@@ -26,7 +30,7 @@ _bootstrap()
 import json
 import threading
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWebEngineWidgets, QtWidgets
 
 from auth import AuthError, M365Auth
 from graph_api import GraphAPI, GraphError
@@ -85,6 +89,52 @@ def _apply_theme(app: QtWidgets.QApplication) -> None:
     )
 
 
+# ── Embedded auth browser ────────────────────────────────────────────────────
+
+class _AuthPage(QtWebEngineWidgets.QWebEnginePage):
+    """WebEngine page that intercepts the OAuth2 localhost redirect."""
+    redirect_received = QtCore.Signal(str)
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+        if is_main_frame and url.host() == "localhost":
+            self.redirect_received.emit(url.toString())
+            return False  # Block — we've captured what we need
+        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
+
+class AuthBrowserDialog(QtWidgets.QDialog):
+    """Modal dialog showing the Microsoft login page in an isolated embedded browser."""
+
+    def __init__(self, auth_url: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Microsoft 365 Sign In")
+        self.resize(520, 660)
+        self.redirect_url: str | None = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Named profile = isolated from the system browser, cookies persist between sessions
+        self._profile = QtWebEngineWidgets.QWebEngineProfile("m365_manager_app", self)
+        self._page = _AuthPage(self._profile, self)
+        self._page.redirect_received.connect(self._on_redirect)
+
+        self._view = QtWebEngineWidgets.QWebEngineView(self)
+        self._view.setPage(self._page)
+        self._view.load(QtCore.QUrl(auth_url))
+        layout.addWidget(self._view)
+
+        cancel_btn = QtWidgets.QPushButton("Cancel sign-in")
+        cancel_btn.setFixedHeight(32)
+        cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(cancel_btn)
+
+    def _on_redirect(self, url: str):
+        self.redirect_url = url
+        self.accept()
+
+
 # ── Login widget ──────────────────────────────────────────────────────────────
 
 class LoginWidget(QtWidgets.QWidget):
@@ -117,7 +167,7 @@ class LoginWidget(QtWidgets.QWidget):
         self.username_input.setPlaceholderText("admin@yourtenant.onmicrosoft.com")
         self.username_input.returnPressed.connect(self._on_connect)
 
-        self.connect_btn = QtWidgets.QPushButton("Sign In  →  Opens browser with MFA")
+        self.connect_btn = QtWidgets.QPushButton("Sign In  →  Opens secure in-app browser")
         self.connect_btn.setObjectName("primary")
         self.connect_btn.setFixedHeight(44)
         self.connect_btn.clicked.connect(self._on_connect)
@@ -127,8 +177,8 @@ class LoginWidget(QtWidgets.QWidget):
         self.status_label.setWordWrap(True)
 
         note = QtWidgets.QLabel(
-            "A Microsoft login page will open in your browser.\n"
-            "Complete sign-in and MFA there — the app will connect automatically."
+            "A Microsoft login window will open inside the app.\n"
+            "Complete sign-in and MFA there — fully isolated from your system browser."
         )
         note.setObjectName("subheading")
         note.setAlignment(QtCore.Qt.AlignCenter)
@@ -153,13 +203,33 @@ class LoginWidget(QtWidgets.QWidget):
         login_hint = self.username_input.text().strip()
 
         self.connect_btn.setEnabled(False)
-        self.connect_btn.setText("Waiting for browser sign-in…")
+        self.connect_btn.setText("Opening sign-in…")
         self.status_label.setObjectName("")
         self.status_label.setText("")
+        QtWidgets.QApplication.processEvents()
 
+        # Step 1: generate the auth URL (fast — no network needed)
+        try:
+            auth_url = self._auth.start_auth_flow(login_hint=login_hint)
+        except (AuthError, Exception) as exc:
+            self._on_failure(str(exc))
+            return
+
+        # Step 2: show embedded browser — user logs in and completes MFA here
+        dlg = AuthBrowserDialog(auth_url, parent=self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted or not dlg.redirect_url:
+            self.connect_btn.setEnabled(True)
+            self.connect_btn.setText("Sign In  →  Opens secure in-app browser")
+            return
+
+        redirect_url = dlg.redirect_url
+        self.connect_btn.setText("Connecting…")
+        QtWidgets.QApplication.processEvents()
+
+        # Step 3: exchange auth code for token (network call — run in thread)
         def _worker():
             try:
-                token = self._auth.login_interactive(login_hint=login_hint)
+                token = self._auth.complete_auth_flow(redirect_url)
                 api = GraphAPI(token)
                 QtCore.QMetaObject.invokeMethod(
                     self, "_on_success",
@@ -178,13 +248,13 @@ class LoginWidget(QtWidgets.QWidget):
     @QtCore.Slot(object)
     def _on_success(self, api: GraphAPI):
         self.connect_btn.setEnabled(True)
-        self.connect_btn.setText("Sign In  →  Opens browser with MFA")
+        self.connect_btn.setText("Sign In  →  Opens secure in-app browser")
         self.logged_in.emit(self._auth, api)
 
     @QtCore.Slot(str)
     def _on_failure(self, message: str):
         self.connect_btn.setEnabled(True)
-        self.connect_btn.setText("Sign In  →  Opens browser with MFA")
+        self.connect_btn.setText("Sign In  →  Opens secure in-app browser")
         self._set_error(message)
 
     def _set_error(self, msg: str):
@@ -830,6 +900,8 @@ class M365ManagerApp(QtWidgets.QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    # Required before QApplication when QtWebEngineWidgets is used
+    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
     app = QtWidgets.QApplication(sys.argv)
     _apply_theme(app)
     window = M365ManagerApp()
