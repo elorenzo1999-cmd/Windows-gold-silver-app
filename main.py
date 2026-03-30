@@ -6,15 +6,15 @@ import sys
 
 def _bootstrap():
     """Auto-install any missing dependencies before the app starts."""
-    pkgs = {
-        "PySide6": "PySide6",
-        "msal": "msal",
-        "requests": "requests",
-    }
+    checks = [
+        ("PySide6", "PySide6"),
+        ("msal", "msal"),
+        ("requests", "requests"),
+    ]
     missing = []
-    for import_name, install_name in pkgs.items():
+    for import_name, install_name in checks:
         try:
-            __import__(import_name.lower())
+            __import__(import_name)
         except ImportError:
             missing.append(install_name)
     if missing:
@@ -30,7 +30,7 @@ _bootstrap()
 import json
 import threading
 
-from PySide6 import QtCore, QtGui, QtWebEngineWidgets, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from auth import AuthError, M365Auth
 from graph_api import GraphAPI, GraphError
@@ -91,48 +91,59 @@ def _apply_theme(app: QtWidgets.QApplication) -> None:
 
 # ── Embedded auth browser ────────────────────────────────────────────────────
 
-class _AuthPage(QtWebEngineWidgets.QWebEnginePage):
-    """WebEngine page that intercepts the OAuth2 localhost redirect."""
-    redirect_received = QtCore.Signal(str)
+def _create_auth_browser_dialog(auth_url: str, parent=None):
+    """Create the embedded auth browser dialog.
 
-    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
-        if is_main_frame and url.host() == "localhost":
-            self.redirect_received.emit(url.toString())
-            return False  # Block — we've captured what we need
-        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+    Imports QtWebEngineWidgets lazily so the app doesn't crash on systems
+    where WebEngine isn't available (falls back handled by caller).
+    """
+    from PySide6 import QtWebEngineWidgets
 
+    class _AuthPage(QtWebEngineWidgets.QWebEnginePage):
+        """WebEngine page that intercepts the OAuth2 localhost redirect."""
+        redirect_received = QtCore.Signal(str)
 
-class AuthBrowserDialog(QtWidgets.QDialog):
-    """Modal dialog showing the Microsoft login page in an isolated embedded browser."""
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            if is_main_frame and url.host() == "localhost":
+                self.redirect_received.emit(url.toString())
+                return False
+            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
-    def __init__(self, auth_url: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Microsoft 365 Sign In")
-        self.resize(520, 660)
-        self.redirect_url: str | None = None
+    class AuthBrowserDialog(QtWidgets.QDialog):
+        """Modal dialog showing the Microsoft login page in an isolated embedded browser."""
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        def __init__(self, auth_url: str, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Microsoft 365 Sign In")
+            self.resize(520, 660)
+            self.redirect_url: str | None = None
 
-        # Named profile = isolated from the system browser, cookies persist between sessions
-        self._profile = QtWebEngineWidgets.QWebEngineProfile("m365_manager_app", self)
-        self._page = _AuthPage(self._profile, self)
-        self._page.redirect_received.connect(self._on_redirect)
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
 
-        self._view = QtWebEngineWidgets.QWebEngineView(self)
-        self._view.setPage(self._page)
-        self._view.load(QtCore.QUrl(auth_url))
-        layout.addWidget(self._view)
+            # Named profile — isolated from system browser; cookies persist between sessions
+            self._profile = QtWebEngineWidgets.QWebEngineProfile(
+                "m365_manager_app", self
+            )
+            self._page = _AuthPage(self._profile, self)
+            self._page.redirect_received.connect(self._on_redirect)
 
-        cancel_btn = QtWidgets.QPushButton("Cancel sign-in")
-        cancel_btn.setFixedHeight(32)
-        cancel_btn.clicked.connect(self.reject)
-        layout.addWidget(cancel_btn)
+            self._view = QtWebEngineWidgets.QWebEngineView(self)
+            self._view.setPage(self._page)
+            self._view.load(QtCore.QUrl(auth_url))
+            layout.addWidget(self._view)
 
-    def _on_redirect(self, url: str):
-        self.redirect_url = url
-        self.accept()
+            cancel_btn = QtWidgets.QPushButton("Cancel sign-in")
+            cancel_btn.setFixedHeight(32)
+            cancel_btn.clicked.connect(self.reject)
+            layout.addWidget(cancel_btn)
+
+        def _on_redirect(self, url: str):
+            self.redirect_url = url
+            self.accept()
+
+    return AuthBrowserDialog(auth_url, parent)
 
 
 # ── Login widget ──────────────────────────────────────────────────────────────
@@ -216,7 +227,14 @@ class LoginWidget(QtWidgets.QWidget):
             return
 
         # Step 2: show embedded browser — user logs in and completes MFA here
-        dlg = AuthBrowserDialog(auth_url, parent=self)
+        try:
+            dlg = _create_auth_browser_dialog(auth_url, parent=self)
+        except ImportError:
+            self._on_failure(
+                "QtWebEngineWidgets is not available.\n"
+                "Run: pip install PySide6-Addons"
+            )
+            return
         if dlg.exec() != QtWidgets.QDialog.Accepted or not dlg.redirect_url:
             self.connect_btn.setEnabled(True)
             self.connect_btn.setText("Sign In  →  Opens secure in-app browser")
@@ -900,8 +918,6 @@ class M365ManagerApp(QtWidgets.QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    # Required before QApplication when QtWebEngineWidgets is used
-    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
     app = QtWidgets.QApplication(sys.argv)
     _apply_theme(app)
     window = M365ManagerApp()
