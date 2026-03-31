@@ -89,6 +89,20 @@ def _apply_theme(app: QtWidgets.QApplication) -> None:
     )
 
 
+# ── Thread → main-thread signal bridge ───────────────────────────────────────
+
+class _Signals(QtCore.QObject):
+    """Carries Python objects safely from worker threads back to the main thread.
+
+    PySide6 6.x dropped support for Q_ARG(object, ...) in invokeMethod.
+    Using Signal(object) instead correctly serialises arbitrary Python objects
+    through the Qt event loop across thread boundaries.
+    """
+    result = QtCore.Signal(object)
+    result2 = QtCore.Signal(object, object)
+    error = QtCore.Signal(str)
+
+
 # ── Embedded auth browser ────────────────────────────────────────────────────
 
 def _create_auth_browser_dialog(auth_url: str, parent=None):
@@ -123,9 +137,10 @@ def _create_auth_browser_dialog(auth_url: str, parent=None):
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(0)
 
-            # Named profile — isolated from system browser; cookies persist between sessions
-            self._profile = QWebEngineProfile("m365_manager_app", self)
-            self._page = _AuthPage(self._profile, self)
+            # Profile has no parent so we control its lifetime explicitly.
+            # Named profile = isolated from system browser; cookies persist between sessions.
+            self._profile = QWebEngineProfile("m365_manager_app")
+            self._page = _AuthPage(self._profile)
             self._page.redirect_received.connect(self._on_redirect)
 
             self._view = QtWebEngineWidgets.QWebEngineView(self)
@@ -137,6 +152,12 @@ def _create_auth_browser_dialog(auth_url: str, parent=None):
             cancel_btn.setFixedHeight(32)
             cancel_btn.clicked.connect(self.reject)
             layout.addWidget(cancel_btn)
+
+        def done(self, result: int):
+            # Delete page before profile — required by Qt WebEngine
+            self._page.deleteLater()
+            self._page = None
+            super().done(result)
 
         def _on_redirect(self, url: str):
             self.redirect_url = url
@@ -244,21 +265,16 @@ class LoginWidget(QtWidgets.QWidget):
         QtWidgets.QApplication.processEvents()
 
         # Step 3: exchange auth code for token (network call — run in thread)
+        signals = _Signals()
+        signals.result.connect(self._on_success)
+        signals.error.connect(self._on_failure)
+
         def _worker():
             try:
                 token = self._auth.complete_auth_flow(redirect_url)
-                api = GraphAPI(token)
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_on_success",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(object, api),
-                )
+                signals.result.emit(GraphAPI(token))
             except (AuthError, Exception) as exc:
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_on_failure",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, str(exc)),
-                )
+                signals.error.emit(str(exc))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -559,22 +575,15 @@ class UsersTab(QtWidgets.QWidget):
         self.status_label.setText("Loading users…")
         QtWidgets.QApplication.processEvents()
 
+        signals = _Signals()
+        signals.result2.connect(self._populate)
+        signals.error.connect(self._set_error)
+
         def _worker():
             try:
-                users = self._api.get_users()
-                skus = self._api.get_subscribed_skus()
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_populate",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(object, users),
-                    QtCore.Q_ARG(object, skus),
-                )
+                signals.result2.emit(self._api.get_users(), self._api.get_subscribed_skus())
             except (GraphError, Exception) as exc:
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_set_error",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, str(exc)),
-                )
+                signals.error.emit(str(exc))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -711,20 +720,15 @@ class LicensesTab(QtWidgets.QWidget):
     def _load(self):
         self.status_label.setText("Loading licenses…")
 
+        signals = _Signals()
+        signals.result.connect(self._populate)
+        signals.error.connect(self._set_error)
+
         def _worker():
             try:
-                skus = self._api.get_subscribed_skus()
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_populate",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(object, skus),
-                )
+                signals.result.emit(self._api.get_subscribed_skus())
             except (GraphError, Exception) as exc:
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_set_error",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, str(exc)),
-                )
+                signals.error.emit(str(exc))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -827,21 +831,16 @@ class GraphExplorerTab(QtWidgets.QWidget):
 
         self.response_area.setPlainText("Running…")
 
+        signals = _Signals()
+        signals.result.connect(self._show_response)
+
         def _worker():
             try:
                 result = self._api.execute(method, endpoint, body)
                 text = json.dumps(result, indent=2) if result is not None else "(no content)"
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_show_response",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, text),
-                )
+                signals.result.emit(text)
             except (GraphError, Exception) as exc:
-                QtCore.QMetaObject.invokeMethod(
-                    self, "_show_response",
-                    QtCore.Qt.QueuedConnection,
-                    QtCore.Q_ARG(str, f"Error:\n{exc}"),
-                )
+                signals.result.emit(f"Error:\n{exc}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
