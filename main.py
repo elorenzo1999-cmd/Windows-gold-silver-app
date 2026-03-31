@@ -98,8 +98,9 @@ def _create_auth_browser_dialog(auth_url: str, parent=None):
     where WebEngine isn't available (falls back handled by caller).
     """
     from PySide6 import QtWebEngineWidgets
+    from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 
-    class _AuthPage(QtWebEngineWidgets.QWebEnginePage):
+    class _AuthPage(QWebEnginePage):
         """WebEngine page that intercepts the OAuth2 localhost redirect."""
         redirect_received = QtCore.Signal(str)
 
@@ -123,9 +124,7 @@ def _create_auth_browser_dialog(auth_url: str, parent=None):
             layout.setSpacing(0)
 
             # Named profile — isolated from system browser; cookies persist between sessions
-            self._profile = QtWebEngineWidgets.QWebEngineProfile(
-                "m365_manager_app", self
-            )
+            self._profile = QWebEngineProfile("m365_manager_app", self)
             self._page = _AuthPage(self._profile, self)
             self._page.redirect_received.connect(self._on_redirect)
 
